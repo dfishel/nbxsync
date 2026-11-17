@@ -6,7 +6,7 @@ from nbxsync.choices.zabbixstatus import ZabbixHostStatus
 from nbxsync.models import ZabbixServerAssignment
 from nbxsync.settings import get_plugin_settings
 from nbxsync.utils import get_assigned_zabbixobjects
-from nbxsync.utils.sync import HostGroupSync, HostInterfaceSync, HostSync, ProxyGroupSync, ProxySync, run_zabbix_operation
+from nbxsync.utils.sync import HostGroupSync, HostSync, ProxyGroupSync, ProxySync
 from nbxsync.utils.sync.safe_delete import safe_delete
 from nbxsync.utils.sync.safe_sync import safe_sync
 from nbxsync.utils.trigger_dependency_sync import sync_device_trigger_dependencies
@@ -38,9 +38,7 @@ class SyncHostJob:
             if zabbix_status == ZabbixHostStatus.DELETED:
                 self.delete_host(assignment)
             else:
-                self.check_default_hostinterface(assignment)
                 self.sync_host(assignment)
-                self.verify_hostinterfaces(assignment)
 
             if object_type == 'device' and zabbix_status != ZabbixHostStatus.DELETED and pluginsettings.trigger_dependencies.enabled:
                 try:
@@ -50,14 +48,6 @@ class SyncHostJob:
 
     def delete_host(self, assignment):
         safe_delete(HostSync, assignment)
-
-    def verify_hostinterfaces(self, assignment):
-        all_objects = get_assigned_zabbixobjects(self.instance, zabbixserver=assignment.zabbixserver)
-        run_zabbix_operation(HostSync, assignment, 'verify_hostinterfaces', extra_args={'all_objects': all_objects})
-
-    def check_default_hostinterface(self, assignment):
-        all_objects = get_assigned_zabbixobjects(self.instance, zabbixserver=assignment.zabbixserver)
-        run_zabbix_operation(HostSync, assignment, 'check_default_hostinterface', extra_args={'all_objects': all_objects})
 
     def sync_host(self, assignment):
         try:
@@ -81,23 +71,15 @@ class SyncHostJob:
             if assignment.zabbixproxygroup:
                 safe_sync(ProxyGroupSync, assignment.zabbixproxygroup)
 
-            # Sync the actual Host
+            # Sync the actual Host, including its host interfaces.
+            # Zabbix 8.0 removed the hostinterface.create/update/delete methods, so interfaces are
+            # sent along with host.create / host.update (this works for older Zabbix versions as well).
             try:
                 safe_sync(HostSync, assignment, extra_args={'all_objects': all_objects})
-            except Exception as e:
-                # This can happen, in cases where the host exists, a new HostInterface is added (SNMP for example) and a new template (which requires SNMP)
-                # In such cases, the Host Update will fail, due to the Interface not existing yet.
-                # Fail silently, so we can create the interface - and we'll sync the template on the next run...
+            except Exception:
+                # A newly created host doesn't get its templates linked on creation; the second pass below links them
+                # and surfaces any error.
                 pass
-
-            # Once the Host exists and we have a HostId, time to sync the interfaces
-            # Sort by:
-            # - interface_type (defaults should be synced first)
-            # - type (group snmp, agent, jmx, etc)
-            # - id
-            hostinterfaces_sorted = sorted(all_objects['hostinterfaces'], key=lambda hostinterface: (-int(hostinterface.interface_type == 1), hostinterface.type, hostinterface.id))
-            for hostinterface in hostinterfaces_sorted:
-                safe_sync(HostInterfaceSync, hostinterface, extra_args={'hostid': assignment.hostid})
 
             safe_sync(HostSync, assignment, extra_args={'all_objects': all_objects})
 

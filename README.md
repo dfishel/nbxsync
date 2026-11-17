@@ -33,6 +33,8 @@ This plugin bridges the gap between network/source-of-truth documentation and in
 | 1.0.1   | 4.2.0                  | 4.4.x                  |
 | 1.0.0   | 4.3.0                  | 4.4.x                  |
 
+Supported Zabbix versions: 7.0 up to and including 8.0. Zabbix 8.0 requires `zabbix_utils` 2.0.5 or newer.
+
 ---
 
 ## 📦 Installation

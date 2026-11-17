@@ -211,9 +211,6 @@ class HostSyncTestCase(TestCase):
         self.sync.delete()
         self.assertIsNone(self.obj.hostid)
 
-    def test_verify_hostinterfaces(self):
-        self.sync.verify_hostinterfaces()
-
     def test_get_name_value(self):
         name = self.sync.get_name_value()
         self.assertEqual(name, self.device.name)
@@ -486,49 +483,6 @@ class HostSyncTestCase(TestCase):
         self.assertNotIn('notes', result['inventory'])
         self.assertNotIn('location', result['inventory'])
 
-    def test_verify_hostinterfaces_skips_when_hostid_missing(self):
-        self.obj.hostid = None  # Simulate no host ID
-
-        # Add a spy/mock to the API to ensure it's NOT called
-        called = {'hostinterface_get': False}
-
-        def fake_get(*args, **kwargs):
-            called['hostinterface_get'] = True  # pragma: no cover
-            return []  # pragma: no cover
-
-        self.sync.api.hostinterface.get = fake_get
-
-        result = self.sync.verify_hostinterfaces()
-
-        # Should return {} and not call the API
-        self.assertEqual(result, {})
-        self.assertFalse(called['hostinterface_get'])
-
-    def test_verify_hostinterfaces_deletes_unexpected_interfaces(self):
-        self.obj.hostid = '12345'
-
-        # Expected interface (from NetBox)
-        self.interface_agent.interfaceid = 1001
-        self.sync.context['all_objects']['hostinterfaces'] = [self.interface_agent]
-
-        # Zabbix returns two interfaces, one extra
-        self.sync.api.hostinterface.get = lambda **kwargs: [
-            {'interfaceid': 1001},  # expected, should not be deleted
-            {'interfaceid': 2002},  # unexpected, should be deleted
-        ]
-
-        deleted_ids = []
-
-        def mock_delete(interfaceid):
-            deleted_ids.append(interfaceid)
-
-        self.sync.api.hostinterface.delete = mock_delete
-
-        self.sync.verify_hostinterfaces()
-
-        # Only the unexpected one should be deleted
-        self.assertEqual(deleted_ids, [2002])
-
     def test_delete_raises_runtimeerror_on_api_failure(self):
         self.obj.hostid = '12345'
 
@@ -554,3 +508,176 @@ class HostSyncTestCase(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertFalse(messages[0][0])  # success = False
         self.assertIn('Simulated API failure', messages[0][1])
+
+    # --- Host interfaces via host.create / host.update (Zabbix 8.0 removed hostinterface.create/update/delete)
+
+    def _set_hostinterface_sot(self, sot):
+        self.sync.pluginsettings.sot.hostinterface = sot
+        self.addCleanup(delattr, self.sync.pluginsettings.sot, 'hostinterface')
+
+    def test_get_create_params_includes_interfaces(self):
+        params = self.sync.get_create_params()
+        self.assertIn('interfaces', params)
+        self.assertEqual(len(params['interfaces']), 3)
+        for interface in params['interfaces']:
+            self.assertNotIn('hostid', interface)
+
+    def test_get_hostinterface_params_without_context_does_not_touch_interfaces(self):
+        del self.sync.context['all_objects']['hostinterfaces']
+        self.assertEqual(self.sync.get_hostinterface_params(), {})
+
+    def test_get_hostinterfaces_keeps_existing_interfaceids(self):
+        self.sync.api.hostinterface.get = lambda **kwargs: [
+            {'interfaceid': '10001', 'type': '1', 'main': '1'},
+            {'interfaceid': '10002', 'type': '2', 'main': '1'},
+            {'interfaceid': '99999', 'type': '1', 'main': '0'},  # Only in Zabbix -> will be removed
+        ]
+
+        interfaces = self.sync.get_hostinterfaces()
+
+        ids = sorted(interface['interfaceid'] for interface in interfaces if interface.get('interfaceid'))
+        self.assertEqual(ids, ['10001', '10002'])
+        # The IPMI interface (10003) no longer exists in Zabbix, so it is sent without interfaceid (created)
+        ipmi = next(interface for interface in interfaces if interface['type'] == ZabbixHostInterfaceTypeChoices.IPMI)
+        self.assertNotIn('interfaceid', ipmi)
+        self.assertEqual([interface['interfaceid'] for interface in self.sync._unmanaged_zabbix_hostinterfaces], ['99999'])
+
+    def test_get_hostinterfaces_sot_zabbix_passes_zabbix_data_through(self):
+        self._set_hostinterface_sot(SyncSOT.ZABBIX)
+        zabbix_agent = {'interfaceid': '10001', 'hostid': '12345', 'type': '1', 'main': '1', 'useip': '1', 'ip': '198.51.100.7', 'dns': '', 'port': '10050', 'available': '1', 'details': []}
+        self.sync.api.hostinterface.get = lambda **kwargs: [zabbix_agent]
+
+        interfaces = self.sync.get_hostinterfaces()
+
+        agent = next(interface for interface in interfaces if interface.get('interfaceid') == '10001')
+        self.assertEqual(agent, {'interfaceid': '10001', 'type': '1', 'main': '1', 'useip': '1', 'ip': '198.51.100.7', 'dns': '', 'port': '10050'})
+
+    def test_normalize_main_hostinterfaces(self):
+        interfaces = [
+            {'type': 1, 'main': 1},
+            {'type': 1, 'main': 1},
+            {'type': 2, 'main': 0},
+            {'type': 2, 'main': 0},
+        ]
+        HostSync.normalize_main_hostinterfaces(interfaces)
+        self.assertEqual([interface['main'] for interface in interfaces], [1, 0, 1, 0])
+
+    def test_clean_zabbix_hostinterface_drops_readonly_and_empty_details(self):
+        cleaned = HostSync.clean_zabbix_hostinterface({'interfaceid': '1', 'hostid': '2', 'type': '1', 'main': '1', 'useip': '1', 'ip': '1.2.3.4', 'dns': '', 'port': '10050', 'available': '1', 'error': '', 'details': []})
+        self.assertEqual(cleaned, {'interfaceid': '1', 'type': '1', 'main': '1', 'useip': '1', 'ip': '1.2.3.4', 'dns': '', 'port': '10050'})
+
+        snmp = HostSync.clean_zabbix_hostinterface({'interfaceid': '1', 'type': '2', 'details': {'version': '2', 'community': 'x'}})
+        self.assertEqual(snmp['details'], {'version': '2', 'community': 'x'})
+
+    def test_match_zabbix_hostinterface(self):
+        candidates = [
+            {'interfaceid': '1', 'type': '1', 'useip': '1', 'ip': '10.0.0.1', 'dns': '', 'port': '10050'},
+            {'interfaceid': '2', 'type': '1', 'useip': '1', 'ip': '10.0.0.2', 'dns': '', 'port': '10050'},
+            {'interfaceid': '3', 'type': '2', 'useip': '1', 'ip': '10.0.0.2', 'dns': '', 'port': '161'},
+        ]
+        wanted = {'type': 1, 'useip': 1, 'ip': '10.0.0.2', 'dns': '', 'port': '10050'}
+        self.assertEqual(HostSync.match_zabbix_hostinterface(wanted, candidates)['interfaceid'], '2')
+
+        # Only one candidate of the type -> picked even if attributes differ
+        wanted_snmp = {'type': 2, 'useip': 1, 'ip': '10.9.9.9', 'dns': '', 'port': '1161'}
+        self.assertEqual(HostSync.match_zabbix_hostinterface(wanted_snmp, candidates)['interfaceid'], '3')
+
+        # No candidates of that type
+        self.assertIsNone(HostSync.match_zabbix_hostinterface({'type': 3}, candidates))
+
+    def test_update_hostinterface_ids_maps_new_interfaces(self):
+        self.interface_snmp.interfaceid = None
+        self.interface_snmp.save()
+        ip = str(self.ip.address.ip)
+
+        self.sync.api.hostinterface.get = lambda **kwargs: [
+            {'interfaceid': '10001', 'type': '1', 'useip': '1', 'ip': ip, 'dns': '', 'port': '161'},
+            {'interfaceid': '20002', 'type': '2', 'useip': '1', 'ip': ip, 'dns': '', 'port': '161'},
+        ]
+
+        self.sync.update_hostinterface_ids('12345')
+
+        self.interface_snmp.refresh_from_db()
+        self.interface_ipmi.refresh_from_db()
+        self.assertEqual(self.interface_snmp.interfaceid, 20002)
+        # The IPMI interface is not in Zabbix -> stale id cleared
+        self.assertIsNone(self.interface_ipmi.interfaceid)
+
+    def test_try_create_strips_interfaceids_and_maps_ids(self):
+        calls = {}
+
+        def fake_create(**kwargs):
+            calls['params'] = kwargs
+            return {'hostids': ['555']}
+
+        self.sync.api.host.create = fake_create
+        # A stale host ID may still resolve interfaces; a new host must never reference them
+        self.sync.api.hostinterface.get = lambda **kwargs: [{'interfaceid': '10001', 'type': '1', 'main': '1'}]
+        mapped = []
+        self.sync.update_hostinterface_ids = lambda hostid: mapped.append(hostid)
+
+        hostid = self.sync.try_create()
+
+        self.assertEqual(hostid, '555')
+        self.assertEqual(mapped, ['555'])
+        for interface in calls['params']['interfaces']:
+            self.assertNotIn('interfaceid', interface)
+
+    def test_try_create_omits_empty_interfaces(self):
+        self.sync.context['all_objects']['hostinterfaces'] = []
+        calls = {}
+
+        def fake_create(**kwargs):
+            calls['params'] = kwargs
+            return {'hostids': ['555']}
+
+        self.sync.api.host.create = fake_create
+        self.sync.try_create()
+        self.assertNotIn('interfaces', calls['params'])
+
+    def test_try_create_raises_runtimeerror(self):
+        def fake_create(**kwargs):
+            raise Exception('boom')
+
+        self.sync.api.host.create = fake_create
+        with self.assertRaises(RuntimeError):
+            self.sync.try_create()
+
+    def test_update_in_zabbix_sends_interfaces(self):
+        calls = []
+        self.sync.api.host.update = lambda **kwargs: calls.append(kwargs)
+        self.sync.update_hostinterface_ids = lambda hostid: None
+
+        self.sync.update_in_zabbix(object_id='12345')
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]['interfaces']), 3)
+
+    def test_update_in_zabbix_retries_keeping_unmanaged_interfaces(self):
+        self.sync.api.hostinterface.get = lambda **kwargs: [
+            {'interfaceid': '10001', 'type': '1', 'main': '1', 'useip': '1', 'ip': '192.0.2.1', 'dns': '', 'port': '161', 'details': []},
+            {'interfaceid': '77777', 'type': '1', 'main': '1', 'useip': '1', 'ip': '192.0.2.77', 'dns': '', 'port': '10050', 'details': []},
+        ]
+        calls = []
+
+        def fake_update(**kwargs):
+            calls.append([dict(interface) for interface in kwargs['interfaces']])
+            if len(calls) == 1:
+                raise Exception('Interface is linked to items')
+
+        self.sync.api.host.update = fake_update
+        self.sync.update_hostinterface_ids = lambda hostid: None
+
+        self.sync.update_in_zabbix(object_id='12345')
+
+        self.assertEqual(len(calls), 2)
+        kept = next(interface for interface in calls[1] if interface.get('interfaceid') == '77777')
+        self.assertEqual(kept['main'], 0)  # The NetBox agent interface stays the default
+
+    def test_update_in_zabbix_reraises_without_unmanaged_interfaces(self):
+        def fake_update(**kwargs):
+            raise Exception('boom')
+
+        self.sync.api.host.update = fake_update
+        with self.assertRaises(Exception):
+            self.sync.update_in_zabbix(object_id='12345')

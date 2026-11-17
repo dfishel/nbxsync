@@ -210,3 +210,17 @@ class HostInterfaceSyncTests(TestCase):
         args, kwargs = self.hostinterface.update_sync_info.call_args
         assert kwargs.get('success') is False
         assert 'invalid literal' in kwargs.get('message')  # message from ValueError
+
+    def test_get_interface_params_has_no_hostid(self):
+        sync = HostInterfaceSync(api=None, netbox_obj=self.hostinterface)
+        params = sync.get_interface_params()
+        self.assertNotIn('hostid', params)
+        self.assertEqual(params['ip'], '10.1.1.1')
+
+    def test_sync_and_delete_are_not_supported(self):
+        # Zabbix 8.0 removed hostinterface.create/update/delete; interfaces are synced via HostSync
+        sync = HostInterfaceSync(api=MagicMock(), netbox_obj=self.hostinterface)
+        with self.assertRaises(NotImplementedError):
+            sync.sync()
+        with self.assertRaises(NotImplementedError):
+            sync.delete()

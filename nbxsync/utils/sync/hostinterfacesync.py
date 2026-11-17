@@ -5,11 +5,26 @@ from .syncbase import ZabbixSyncBase
 
 
 class HostInterfaceSync(ZabbixSyncBase):
+    """
+    Builds Zabbix host interface payloads from a NetBox ZabbixHostInterface.
+
+    Since Zabbix 8.0 the hostinterface.create/update/delete methods no longer exist; host interfaces
+    can only be managed through host.create / host.update (the `interfaces` property). That approach
+    also works on older Zabbix versions, so HostSync is responsible for pushing interfaces and this
+    class only renders the interface objects (and pulls data back when Zabbix is the source of truth).
+    """
+
     id_field = 'interfaceid'
     sot_key = 'hostinterface'
 
     def api_object(self):
         return self.api.hostinterface
+
+    def sync(self):
+        raise NotImplementedError('Host interfaces are synced as part of the host (host.create / host.update); use HostSync instead.')
+
+    def delete(self):
+        raise NotImplementedError('Host interfaces are removed by omitting them from host.update; use HostSync instead.')
 
     def get_name_value(self):
         return self.obj.assigned_object.name
@@ -28,13 +43,16 @@ class HostInterfaceSync(ZabbixSyncBase):
             # Update the hostid field :)
             hostid = zbxserverassignment.hostid
 
+        return {'hostid': hostid, **self.get_interface_params()}
+
+    def get_interface_params(self):
+        """Return the interface object as accepted in the `interfaces` property of host.create / host.update."""
         ipaddr = ''
         if self.obj.ip_id:
             ipaddr = IPAddress.objects.get(id=self.obj.ip_id).address.ip
 
         dns_name, _ = self.obj.render_dns()
         result = {
-            'hostid': hostid,
             'type': self.obj.type,
             'ip': str(ipaddr),
             'dns': dns_name,

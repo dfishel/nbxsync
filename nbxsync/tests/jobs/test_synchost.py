@@ -73,7 +73,6 @@ class SyncHostJobTestCase(TestCase):
         mock_api.host.update.return_value = {'hostids': ['12345']}
         mock_api.host.delete.return_value = True
         mock_api.hostinterface.get.return_value = []
-        mock_api.hostinterface.create.return_value = {'interfaceids': ['999']}
         mock_api.proxy.get.return_value = [
             {
                 'proxyid': '42',
@@ -98,6 +97,7 @@ class SyncHostJobTestCase(TestCase):
 
         # Assign API to context manager return
         mock_conn_class.return_value.__enter__.return_value = mock_api
+        self.mock_api = mock_api
 
     def test_run_sync_host_success(self):
         job = SyncHostJob(instance=self.device)
@@ -153,8 +153,7 @@ class SyncHostJobTestCase(TestCase):
         job.run()
 
     @patch('nbxsync.jobs.synchost.safe_sync')
-    @patch.object(SyncHostJob, 'verify_hostinterfaces')  # Prevent interface verification from running
-    def test_sync_host_with_proxygroup(self, mock_verify_interfaces, mock_safe_sync):
+    def test_sync_host_with_proxygroup(self, mock_safe_sync):
         self.zabbixserverassignment.zabbixproxy = None
         self.zabbixserverassignment.zabbixproxygroup = self.proxygroup
         self.zabbixserverassignment.save()
@@ -166,8 +165,7 @@ class SyncHostJobTestCase(TestCase):
         self.assertIn(ProxyGroupSync, called_types)
 
     @patch('nbxsync.jobs.synchost.safe_sync')
-    @patch.object(SyncHostJob, 'verify_hostinterfaces')  # prevent irrelevant logic from running
-    def test_sync_host_raises_runtimeerror_on_exception(self, mock_verify_interfaces, mock_safe_sync):
+    def test_sync_host_raises_runtimeerror_on_exception(self, mock_safe_sync):
         # Force safe_sync to raise an error (e.g., during HostGroupSync)
         mock_safe_sync.side_effect = ValueError('Simulated failure')
 
@@ -179,8 +177,7 @@ class SyncHostJobTestCase(TestCase):
         self.assertIn('Unexpected error: Simulated failure', str(context.exception))
 
     @patch('nbxsync.jobs.synchost.safe_sync')
-    @patch.object(SyncHostJob, 'verify_hostinterfaces')
-    def test_sync_host_hostsync_exception_is_swallowed(self, mock_verify_interfaces, mock_safe_sync):
+    def test_sync_host_hostsync_exception_is_swallowed(self, mock_safe_sync):
         hostsync_call_count = {'count': 0}
 
         def side_effect(sync_class, *args, **kwargs):
@@ -206,8 +203,24 @@ class SyncHostJobTestCase(TestCase):
 
         self.assertGreaterEqual(hostsync_call_count['count'], 2)
 
+        # Host interfaces are synced as part of the host (Zabbix 8.0 removed hostinterface.create/update/delete)
         interface_sync_called = any(getattr(call.args[0], '__name__', None) == 'HostInterfaceSync' for call in mock_safe_sync.call_args_list)
-        self.assertTrue(interface_sync_called)
+        self.assertFalse(interface_sync_called)
+
+    def test_run_syncs_interfaces_via_host_methods(self):
+        job = SyncHostJob(instance=self.device)
+        job.run()
+
+        # hostinterface.create/update/delete no longer exist in Zabbix 8.0
+        self.mock_api.hostinterface.create.assert_not_called()
+        self.mock_api.hostinterface.update.assert_not_called()
+        self.mock_api.hostinterface.delete.assert_not_called()
+
+        self.mock_api.host.update.assert_called()
+        interfaces = self.mock_api.host.update.call_args.kwargs['interfaces']
+        self.assertEqual(len(interfaces), 1)
+        self.assertEqual(interfaces[0]['ip'], '192.168.1.100')
+        self.assertEqual(interfaces[0]['main'], 1)
 
     @patch('nbxsync.jobs.synchost.safe_sync')
     def test_run_skips_sync_when_assignment_sync_disabled(self, mock_safe_sync):
